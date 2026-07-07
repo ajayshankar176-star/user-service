@@ -3,63 +3,95 @@ pipeline {
     agent any
 
     environment {
-        AWS_DEFAULT_REGION = 'us-east-1'
-        S3_BUCKET = 'project2313'
-        CLOUDFRONT_DISTRIBUTION_ID = 'E1V3TFXWWT9W35'
+        AWS_REGION = "us-east-1"
+        ECR_REPO = "order-service"
+        ECS_CLUSTER = "webapp-day"
+        ECS_SERVICE = "arun-order-service-service"
+        TASK_DEF_NAME = "arun-order-service"
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        AWS_ACCOUNT_ID = "526081839201"
+        ECR_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
     }
 
     stages {
 
-        stage('Checkout Code') {
+        stage('Checkout') {
             steps {
-                git branch: 'main',
-                url: 'https://github.com/ajayshankar176-star/my-frontend-app.git'
+                checkout scm
             }
         }
 
-        stage('Verify Files') {
+        stage('Build Docker Image') {
             steps {
-                sh 'ls -la'
+                sh '''
+                docker build -t $ECR_REPO:$IMAGE_TAG .
+                docker tag $ECR_REPO:$IMAGE_TAG $ECR_URI:$IMAGE_TAG
+                '''
             }
         }
 
-        stage('Deploy to S3') {
+        stage('Login to ECR') {
             steps {
-
-                withAWS(credentials: 'aws-credentials', region: 'us-east-1') {
-
-                    sh '''
-                    aws s3 sync . s3://$S3_BUCKET --delete \
-                    --exclude ".git/*" \
-                    --exclude "Jenkinsfile"
-                    '''
-                }
+                sh '''
+                aws ecr get-login-password --region $AWS_REGION | \
+                docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+                '''
             }
         }
 
-        stage('Invalidate CloudFront Cache') {
+        stage('Push to ECR') {
             steps {
+                sh '''
+                docker push $ECR_URI:$IMAGE_TAG
+                '''
+            }
+        }
 
-                withAWS(credentials: 'aws-credentials', region: 'us-east-1') {
+        stage('Register New Task Definition') {
+            steps {
+                sh '''
+                aws ecs describe-task-definition \
+                  --task-definition $TASK_DEF_NAME \
+                  --query taskDefinition > task-def.json
 
-                    sh '''
-                    aws cloudfront create-invalidation \
-                    --distribution-id $CLOUDFRONT_DISTRIBUTION_ID \
-                    --paths "/*"
-                    '''
-                }
+                cat task-def.json | jq --arg IMAGE "$ECR_URI:$IMAGE_TAG" '
+                  .containerDefinitions[0].image = $IMAGE |
+                  del(
+                    .taskDefinitionArn,
+                    .revision,
+                    .status,
+                    .requiresAttributes,
+                    .compatibilities,
+                    .registeredAt,
+                    .registeredBy
+                  )' > new-task-def.json
+
+                aws ecs register-task-definition \
+                  --cli-input-json file://new-task-def.json
+                '''
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                sh '''
+                aws ecs update-service \
+                  --cluster $ECS_CLUSTER \
+                  --service $ECS_SERVICE \
+                  --task-definition $TASK_DEF_NAME \
+                  --region $AWS_REGION
+
+                aws ecs wait services-stable \
+                  --cluster $ECS_CLUSTER \
+                  --services $ECS_SERVICE
+                '''
             }
         }
     }
 
     post {
-
-        success {
-            echo 'Website deployed successfully to S3 and CloudFront cache cleared'
-        }
-
-        failure {
-            echo 'Pipeline failed'
+        always {
+            sh 'docker image prune -f'
         }
     }
 }
